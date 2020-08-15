@@ -1,26 +1,34 @@
 # drbd-perf-on-aws
 # 1.はじめに
-オンプレで共有ディスクを用いたHA構成をクラウド上で実現しようとした場合、単純には共有ディスク構成を作ることができません(左図)。一応、AWSではマルチアタッチを使用して複数インスタンスにEBSを割当てたり、Azureでも同様な機能は提供されてはいますが、制約もあるためそのまま共有ディスクの変わりというわけにはいかないようです。
+オンプレでのHAクラスタをクラウド上で実現する際、単純には共有ディスク構成を作ることができません(2020.8)。一応、AWSではマルチアタッチを使用して複数インスタンスにEBSを割当てたり、Azureでも同様な機能は提供されてはいますが、制約もあるためそのまま共有ディスクの変わりというわけにはいかないようです。
 ※上記AWS/Azureいずれの機能も(アベイラビリティ)ゾーンを跨いだ構成は組めません。
 
 - [Amazon EBSのマルチアタッチ機能とAzure Shared Disksを比較してみる](https://qiita.com/hayao_k/items/b978cd26622536000a6a)
 - [EBS Multi-Attachの使いどころを考えてみた](https://dev.classmethod.jp/articles/ebs-multi-attach-usecase-thought/)
 
-<img width="600" alt="img1.png" src="https://qiita-image-store.s3.ap-northeast-1.amazonaws.com/0/181305/90dce159-535d-7a8f-659d-ff6605d1a661.png">
+<img width="1000" alt="img1.png" src="https://qiita-image-store.s3.ap-northeast-1.amazonaws.com/0/181305/63bfc062-8d36-cef8-de83-b41b52d50c2e.png">
 
-他のやり方として、レプリケーションソフトを使って代替する手があるのですが(右図)、その場合はレプリケーションソフトによる同期処理による(write)性能が気になります。本記事では、AWS上にDRBDというボリュームレプリケーション(OSS)を使って擬似HA構成を組んだ場合、write性能がどうなるか調べてみたいと思います。
+従って、共有ディスクを使わずに、ノード間でデータをリアルタイムに同期させて共有するミラーリング方式や、リアルタイムではなく、一定間隔でデータの同期をとるレプリケーション方式といった他のやり方を考える必要があります(その他にも、Cephなど分散ストレージを使うというのも一手かもしれません)。
+それぞれの方式にはメリット・デメリットがありますが、ここでは「ミラーリング方式」について検討してみたいと思います。
+
+ミラーリング方式では、複数箇所にデータを書込むため、1箇所に書込むよりオーバーヘッドが発生します(他方、読込みはどこか1箇所を参照するだけなので、読込み負荷は分散させることが可能です)。さらに、AWSなどパブリッククラウドで、AZを跨いだ場合には、物理的な距離が遠くなるため、書込み性能への影響が気になるところです。
+
+本記事では、AWS上にDRBDというミラーリングソフトウェア(OSS/Active-Backup構成)を使った場合の書込み性能を調べてみたいと思います。
 
 # 2.システム構成
-## 2-1.概略イメージ
-<img width="800" alt="img7.png" src="https://qiita-image-store.s3.ap-northeast-1.amazonaws.com/0/181305/5f90a1ee-7f2a-b2ef-8cf1-e83093447495.png">
+## 2-1.測定イメージ
+測定は、下記の2パターンでの影響を試してみました。
+
+- [アプリケーション負荷テスト]PostgreSQLと、そのベンチマークツールpgbenchを使ったテスト
+- [ディスク負荷テスト]ディスク負荷ツールfioを使ったテスト
+
+
+<img width="800" alt="img2.png" src="https://qiita-image-store.s3.ap-northeast-1.amazonaws.com/0/181305/5c7464fe-86fc-dc61-80bd-18f6d6084e2a.png">
 
 ## 2-2.AWS構成図
 <img width="800" alt="img3.png" src="https://qiita-image-store.s3.ap-northeast-1.amazonaws.com/0/181305/b0ff917e-9057-a3df-9397-aae450de22c8.png">
 
-## 2-3.性能測定イメージ
-<img width="600" alt="img2.png" src="https://qiita-image-store.s3.ap-northeast-1.amazonaws.com/0/181305/ac086dcd-d694-41c4-30e8-f8cb5f56f1d4.png">
-
-## 2-4.ホスト情報
+## 2-3.ホスト情報
 - host1-3共通:
     - t2/medium
     - CentOS 8.2.2004
@@ -43,6 +51,10 @@
     - ディスク:
         - /dev/xvda - OS
         - /dev/xvdb – DRBD (/dev/drbd1) 
+
+図にすると、このような感じになります。
+
+<img width="700" alt="img7.png" src="https://qiita-image-store.s3.ap-northeast-1.amazonaws.com/0/181305/c3484fc4-45e2-ecfd-a353-95dacaef832d.png">
 
 # 3.環境構築
 ## 3-1.OS準備
@@ -232,62 +244,9 @@ Environment=PGDATA=/mnt/drbd0-fs
 
 データベースのセットアップは以上になります。
 
-# 4.ディスク性能測定(fio)
+
+# 4.アプリ性能測定(pgbench)
 ## 4-1.測定方法
-### fio設定ファイル
-
-```:fio.conf
-[global]
-ioengine=libaio
-iodepth=1
-size=1g
-direct=1
-runtime=30
-stonewall
-
-[Seq-Write-1M]
-bs=1m
-rw=write
-
-[Rand-Write-1M]
-bs=1m
-rw=randwrite
-
-[Rand-Write-512K]
-bs=512k
-rw=randwrite
-
-[Rand-Write-4K]
-bs=4k
-rw=randwrite
-```
-### fioによる測定
-Terminalを3つ立上げ、それぞれのTerminalにて下記を順次実行。fioの実行が終わったら、iostatとdstatをCtl+Cで止める。
-
-```
-//Terminal1で実行
-iostat -mx 1 | grep --line-buffered drbd0 |  awk '{print strftime("%y/%m/%d %H:%M:%S"), $0}' | tee iostat_drbd0.txt
-//Terminal2で実行
-dstat -t | tee dstat_drbd0.txt
-//Terminal3で実行
-fio --filename=/dev/drbd0 fio.conf
-```
-
-## 4-2.測定結果(1)(スループット)
-<img width="1200" alt="img4.png" src="https://qiita-image-store.s3.ap-northeast-1.amazonaws.com/0/181305/c6e7a740-1494-24c6-c882-483e93b4ab2e.png">
-
-## 4-3.測定結果(2)(write待ち時間)
-iostatの「w_await」結果。[iostat manual](https://man7.org/linux/man-pages/man1/iostat.1.html)によると、
-
->
-The average time (in milliseconds) for write requests issued to the device to be served. This includes the time spent by the requests in queue and the time spent servicing them.
-
-とのこと。
-
-<img width="600" alt="img5.png" src="https://qiita-image-store.s3.ap-northeast-1.amazonaws.com/0/181305/6560bdcc-feb5-4a3f-0fcc-927927d3ad7c.png">
-
-# 5.アプリ性能測定(pgbench)
-## 5-1.測定方法
 こちらのサイトを参考に、pgbenchによる測定を行います。
 
 - pgbenchマニュアル (https://www.postgresql.jp/document/9.2/html/pgbench.html)
@@ -316,8 +275,65 @@ $ exit   #postgresユーザから抜ける
 ```
 上記より性能(TPS)は1097程度出ている事がわかります(PostgreSQLへの接続オーバーヘッド有り/無しで2パターンTPSは表示さる)。また、オプションとして「-l」を指定している事により実行後ローカルに「pgbench_log.1163」というトランザクション詳細結果ファイルが作成されます(詳細につきましては、上記サイトを確認ください)。これをデータベースを切替えてそれぞれ実行します。
 
-## 5-2.測定結果(TPS&応答時間)
+## 4-2.測定結果(TPS&応答時間)
 <img width="1684" alt="img6.png" src="https://qiita-image-store.s3.ap-northeast-1.amazonaws.com/0/181305/9893c059-4a60-179e-9ca9-da3a895364bd.png">
+
+# 5.ディスク性能測定(fio)
+## 5-1.測定方法
+ディスク性能測定に使えるベンチマークツールとしては、[詳解 システム・パフォーマンス](https://www.amazon.co.jp/dp/4873117909)によると、dd、Bonnie、Bonnie++、iozone、tiobench、SysBench、fio、FileBenchなど多々ありますが、今回はfio(Flexible IO Tester)を使ってみました(著者のJens Axboe氏は同年代だそうで少し親しみもありますw)。高機能なのですが、全く使いこなせていないため、今後勉強していきたいと思います。。。
+
+ジョブファイルという設定ファイルを設定し、カレントディレクトリに格納します。※各種詳細は[こちら](https://fio.readthedocs.io/en/latest/index.html)。
+### fio設定ファイル
+```:fio.conf
+[global]
+ioengine=libaio
+iodepth=1
+size=1g
+direct=1
+runtime=30
+stonewall
+
+[Seq-Write-1M]
+bs=1m
+rw=write
+
+[Rand-Write-1M]
+bs=1m
+rw=randwrite
+
+[Rand-Write-512K]
+bs=512k
+rw=randwrite
+
+[Rand-Write-4K]
+bs=4k
+rw=randwrite
+```
+
+次に、負荷をかけている間のプロファイリングには「iostat」と「dstat」というツールを利用しました。Terminalを3つ立上げ、先にiostatとdstatを起動した上でfioを実行。fioの実行が終わったら、iostatとdstatをCtl+Cで止めます。fioの実行では、「--filename」オプションではディレクトリだけでなくデバイスも指定できるようです。
+
+```
+//Terminal1で実行
+iostat -mx 1 | grep --line-buffered drbd0 |  awk '{print strftime("%y/%m/%d %H:%M:%S"), $0}' | tee iostat_drbd0.txt
+//Terminal2で実行
+dstat -t | tee dstat_drbd0.txt
+//Terminal3で実行
+fio --filename=/dev/drbd0 fio.conf
+```
+これを、drbd0、drbd1、ローカルディスクそれぞれで実行してプロファイルした結果は次の通りです。
+
+## 5-2.測定結果(1)(スループット)
+<img width="1200" alt="img4.png" src="https://qiita-image-store.s3.ap-northeast-1.amazonaws.com/0/181305/c6e7a740-1494-24c6-c882-483e93b4ab2e.png">
+
+## 5-3.測定結果(2)(write待ち時間)
+iostatの「w_await」結果。[iostat manual](https://man7.org/linux/man-pages/man1/iostat.1.html)によると、
+
+>
+The average time (in milliseconds) for write requests issued to the device to be served. This includes the time spent by the requests in queue and the time spent servicing them.
+
+とのこと。
+
+<img width="600" alt="img5.png" src="https://qiita-image-store.s3.ap-northeast-1.amazonaws.com/0/181305/6560bdcc-feb5-4a3f-0fcc-927927d3ad7c.png">
 
 # 6.まとめ
 TBD
